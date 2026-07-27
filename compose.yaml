@@ -1,0 +1,82 @@
+name: spark-lineage
+
+services:
+  arangodb:
+    image: arangodb:${ARANGO_DB_VERSION}
+    container_name: spline-arangodb
+    restart: on-failure
+    ports:
+      - "${ARANGO_DB_PORT}:8529"
+    environment:
+      ARANGO_NO_AUTH: 1
+    volumes:
+      - arangodb-data:/var/lib/arangodb3
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8529/_admin/server/availability"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  db-init:
+    build:
+      context: .
+      dockerfile: docker/spline-admin/Dockerfile
+      args:
+        SPLINE_SERVER_VERSION: ${SPLINE_SERVER_VERSION}
+    container_name: spline-db-init
+    depends_on:
+      arangodb:
+        condition: service_healthy
+    command: ["db-init", "arangodb://arangodb:8529/spline", "-s"]
+    restart: "no"
+
+  spline-rest:
+    image: absaoss/spline-rest-server:${SPLINE_SERVER_VERSION}
+    container_name: spline-rest-server
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    ports:
+      - "${SPLINE_REST_PORT}:8080"
+    environment:
+      SPLINE_DATABASE_CONNECTION_URL: arangodb://arangodb:8529/spline
+      CATALINA_OPTS: "-Dsecurerandom.source=file:/dev/./urandom -Djava.security.egd=file:/dev/./urandom"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/about/version"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  spline-ui:
+    image: absaoss/spline-web-ui:${SPLINE_UI_VERSION}
+    container_name: spline-web-ui
+    depends_on:
+      spline-rest:
+        condition: service_healthy
+    ports:
+      - "${SPLINE_UI_PORT}:8080"
+    volumes:
+      - ./docker/spline-ui/config.json:/usr/local/tomcat/webapps/ROOT/app/assets/config.json:ro
+
+  jupyter:
+    build:
+      context: ./docker/jupyter
+    image: spark-lineage/jupyter:${SPLINE_AGENT_VERSION}
+    container_name: spark-lineage-jupyter
+    depends_on:
+      spline-rest:
+        condition: service_healthy
+    ports:
+      - "${JUPYTER_PORT}:8888"
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+      JUPYTER_TOKEN: spline
+      SPLINE_PRODUCER_URL: http://spline-rest:8080/producer
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./data:/home/jovyan/data
+      - jupyter-home:/home/jovyan
+
+volumes:
+  arangodb-data:
+  jupyter-home:

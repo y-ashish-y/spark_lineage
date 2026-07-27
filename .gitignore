@@ -1,0 +1,9 @@
+data/warehouse
+data/notebooks
+data/iceberg
+data/seed
+.venv
+__pycache__
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
