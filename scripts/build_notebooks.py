@@ -6,6 +6,19 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+LINEAGE_CHEATSHEET = (
+    "## Lineage cheat sheet",
+    "",
+    "| Your transformation | Spline node to click | Column to inspect |",
+    "|--------------------|----------------------|-------------------|",
+    "| `UNIX_TIMESTAMP` diff | `Project` | `trip_minutes` |",
+    "| `GROUP BY` + `SUM` | `Aggregate` | `revenue`, `trips` |",
+    "| Column select | `Project` | dropped columns absent in output |",
+    "",
+    "In Spline UI: Execution Plan → turn off Compact view → click the node →",
+    "Output Schema → select a column → Lineage.",
+)
+
 
 def _cell(cell_type: str, source: str) -> dict:
     return {
@@ -28,6 +41,29 @@ def _code(*lines: str) -> dict:
     return _cell("code", _source(*lines))
 
 
+def _lineage_inspect_cells(sinks: list[tuple[str, str]]) -> list[dict]:
+    """Markdown + code cells for Consumer API column lineage inspection."""
+    sink_lines = "\n".join(
+        f"inspect_event_column('{name}', '{column}')" for name, column in sinks
+    )
+    return [
+        _markdown(
+            "## Inspect lineage (Consumer API)",
+            "",
+            "Text fallback when the graph UI feels opaque. Also open",
+            "<http://localhost:9090> and follow the cheat sheet above.",
+            "",
+            "Consumer API docs: <http://localhost:8080/docs/consumer.html>",
+        ),
+        _code(
+            "from _shared.lineage_inspect import list_recent_events, inspect_event_column",
+            "",
+            "list_recent_events()",
+            sink_lines,
+        ),
+    ]
+
+
 def pyspark_notebook() -> dict:
     return {
         "cells": [
@@ -35,16 +71,13 @@ def pyspark_notebook() -> dict:
                 "# 01 — PySpark lineage with Spline",
                 "",
                 "Reads the 100-row NYC Yellow Taxi sample, transforms it via the",
-                "DataFrame API, and writes both an Iceberg table and a Parquet sink.",
-                "Each persistent write produces a Spline lineage event that you can",
-                "inspect at <http://localhost:9090>.",
+                "DataFrame API, and writes Parquet sinks so Spline captures full",
+                "column-level lineage. Iceberg tables are optional analytics artifacts",
+                "with weaker lineage visibility.",
                 "",
-                "**Note**: Spline's stock Spark agent detects most write commands but",
-                "the Iceberg `CreateTableAsSelect` flow wraps the plan in an",
-                "Iceberg-specific node that the agent does not currently expose.",
-                "So we also write a Parquet sink so the lineage is guaranteed to",
-                "appear in Spline UI. The Iceberg table is still the artifact used",
-                "for downstream queries.",
+                "Inspect results at <http://localhost:9090>.",
+                "",
+                *LINEAGE_CHEATSHEET,
             ),
             _code(
                 "from pyspark.sql import functions as F",
@@ -95,41 +128,50 @@ def pyspark_notebook() -> dict:
                 "zone_revenue.show(5, truncate=False)",
             ),
             _markdown(
-                "## Persist lineage",
+                "## Persist lineage (Parquet — primary)",
                 "",
-                "Both writes are persistent actions, so Spline will emit a lineage",
-                "event for each. The Iceberg table is the analytics-grade artifact,",
-                "the Parquet sink guarantees Spline captures the column-level",
-                "transformations.",
+                "Parquet writes produce the clearest Spline graphs: `Project` for",
+                "`trip_minutes`, `Aggregate` for `revenue`. Inspect these events first",
+                "in the UI.",
             ),
             _code(
+                "(trip_durations.write",
+                " .mode('overwrite')",
+                " .parquet(f'{PARQUET_SINK}/trip_durations'))",
+                "",
+                "(zone_revenue.write",
+                " .mode('overwrite')",
+                " .parquet(f'{PARQUET_SINK}/zone_revenue'))",
+                "",
+                "print('wrote trip_durations and zone_revenue (parquet)')",
+            ),
+            _markdown(
+                "## Optional: Iceberg tables (analytics artifact)",
+                "",
+                "Iceberg `CreateTableAsSelect` wraps the Spark plan in extra nodes.",
+                "Use these tables for downstream SQL, but prefer the Parquet events",
+                "above when exploring column lineage in Spline UI.",
+            ),
+            _code(
+                "spark.sql('CREATE NAMESPACE IF NOT EXISTS local.taxi')",
+                "",
                 "(trip_durations.write",
                 " .format('iceberg')",
                 " .mode('overwrite')",
                 " .saveAsTable('local.taxi.trip_durations'))",
                 "",
-                "# Spline-supported sink — always visible in Spline UI.",
                 "(zone_revenue.write",
+                " .format('iceberg')",
                 " .mode('overwrite')",
-                " .parquet(f'{PARQUET_SINK}/zone_revenue'))",
+                " .saveAsTable('local.taxi.zone_revenue'))",
                 "",
-                "print('wrote trip_durations (iceberg) and zone_revenue (parquet)')",
+                "print('wrote trip_durations and zone_revenue (iceberg)')",
             ),
-            _markdown(
-                "## Confirm what Spline sees",
-                "",
-                "The producer is on `spline-rest:8080`. After these writes, open",
-                "<http://localhost:9090> and look for the latest execution events.",
-                "The `zone_revenue` write should show a full column-level graph",
-                "from `yellow_trip_sample.csv` to the Parquet sink.",
-            ),
-            _code(
-                "import urllib.request, json",
-                "events = json.loads(urllib.request.urlopen('http://spline-rest:8080/consumer/execution-events').read())",
-                "events = events.get('items', events)",
-                "print('captured events:', len(events))",
-                "for e in events[:5]:",
-                "    print(' -', e.get('name'), '|', e.get('id'))",
+            *_lineage_inspect_cells(
+                [
+                    ("trip_durations", "trip_minutes"),
+                    ("zone_revenue", "revenue"),
+                ]
             ),
         ],
         "metadata": {
@@ -148,28 +190,32 @@ def spark_sql_notebook() -> dict:
                 "# 02 — Spark SQL lineage with Spline",
                 "",
                 "Same NYC Yellow Taxi sample, queries expressed in Spark SQL.",
-                "Each persistent `INSERT` produces a Spline lineage event.",
+                "Each persisted `CREATE TABLE AS` produces a Spline lineage event.",
+                "Transformations are inlined in the write — not split across temp views.",
+                "",
+                "Inspect results at <http://localhost:9090>.",
+                "",
+                *LINEAGE_CHEATSHEET,
             ),
             _code(
-                "from pyspark.sql import SparkSession",
                 "from _shared.spark_session import get_spark, SAMPLE_CSV, PARQUET_SINK",
                 "",
                 "spark = get_spark()",
                 "spark.sparkContext.setLogLevel('WARN')",
                 "",
-                "spark.sql('CREATE NAMESPACE IF NOT EXISTS local.taxi')",
                 "spark.read.csv(SAMPLE_CSV, header=True, inferSchema=True).createOrReplaceTempView('taxi_raw')",
-                "spark.sql('CREATE OR REPLACE TABLE local.taxi.taxi_raw USING iceberg AS SELECT * FROM taxi_raw')",
                 "print('raw row count:', spark.sql('SELECT COUNT(*) FROM taxi_raw').first()[0])",
             ),
             _markdown(
-                "## Aggregations",
+                "## Persist lineage (full SQL in each write)",
                 "",
-                "Two SQL views we'll persist to Iceberg.",
+                "Both statements contain the full transformation and write Parquet tables.",
+                "Spline should show `Project` (trip duration calc) and `Aggregate`",
+                "(zone revenue) directly on these execution plans.",
             ),
             _code(
                 "spark.sql(\"\"\"",
-                "    CREATE OR REPLACE TEMP VIEW trip_durations_sql AS",
+                "    CREATE OR REPLACE TABLE local.taxi.trip_durations_sql USING parquet AS",
                 "    SELECT",
                 "        PULocationID,",
                 "        DOLocationID,",
@@ -183,7 +229,7 @@ def spark_sql_notebook() -> dict:
                 "\"\"\")",
                 "",
                 "spark.sql(\"\"\"",
-                "    CREATE OR REPLACE TEMP VIEW zone_revenue_sql AS",
+                "    CREATE OR REPLACE TABLE local.taxi.zone_revenue_sql USING parquet AS",
                 "    SELECT PULocationID,",
                 "           COUNT(*) AS trips,",
                 "           ROUND(SUM(fare_amount), 2) AS revenue,",
@@ -193,40 +239,13 @@ def spark_sql_notebook() -> dict:
                 "    ORDER BY revenue DESC",
                 "\"\"\")",
                 "",
-                "spark.sql('SELECT * FROM trip_durations_sql LIMIT 5').show(truncate=False)",
-                "spark.sql('SELECT * FROM zone_revenue_sql LIMIT 5').show(truncate=False)",
+                "print('wrote trip_durations_sql and zone_revenue_sql (parquet)')",
             ),
-            _markdown(
-                "## Persist (Spline captures every `INSERT INTO`)",
-                "",
-                "Both inserts are persistent actions, so Spline emits a lineage",
-                "event for each. The Parquet insert is the enforced lineage sink.",
-            ),
-            _code(
-                "spark.sql(\"\"\"",
-                "    CREATE OR REPLACE TABLE local.taxi.trip_durations_sql USING iceberg AS",
-                "    SELECT * FROM trip_durations_sql",
-                "\"\"\")",
-                "",
-                "spark.sql(f\"\"\"",
-                "    CREATE OR REPLACE TABLE local.taxi.zone_revenue_sql USING parquet AS",
-                "    SELECT * FROM zone_revenue_sql",
-                "\"\"\")",
-                "",
-                "print('SQL lineage produced for trip_durations_sql and zone_revenue_sql')",
-            ),
-            _markdown(
-                "## Confirm",
-                "",
-                "Same idea as notebook 01 — list the events Spline recorded.",
-            ),
-            _code(
-                "import urllib.request, json",
-                "events = json.loads(urllib.request.urlopen('http://spline-rest:8080/consumer/execution-events').read())",
-                "events = events.get('items', events)",
-                "print('captured events:', len(events))",
-                "for e in events[:5]:",
-                "    print(' -', e.get('name'), '|', e.get('id'))",
+            *_lineage_inspect_cells(
+                [
+                    ("trip_durations_sql", "trip_minutes"),
+                    ("zone_revenue_sql", "revenue"),
+                ]
             ),
         ],
         "metadata": {
